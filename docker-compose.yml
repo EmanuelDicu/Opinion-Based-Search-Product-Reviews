@@ -1,0 +1,108 @@
+version: '3.8'
+
+services:
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.11.0
+    container_name: opinion-search-elasticsearch
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - "ES_JAVA_OPTS=-Xms512m -Xmx512m"
+    ports:
+      - "9200:9200"
+      - "9300:9300"
+    volumes:
+      - elasticsearch_data:/usr/share/elasticsearch/data
+    networks:
+      - opinion-search-network
+    healthcheck:
+      test: [ "CMD-SHELL", "curl -f http://localhost:9200/_cluster/health || exit 1" ]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  preprocessing:
+    build:
+      context: .
+      dockerfile: preprocessing/Dockerfile
+    container_name: opinion-search-preprocessing
+    environment:
+      - ELASTICSEARCH_HOST=elasticsearch
+      - ELASTICSEARCH_PORT=9200
+      - ELASTICSEARCH_SCHEME=http
+      - ELASTICSEARCH_INDEX=product_reviews
+      - DATA_DIR=/app/data
+      - DATASET_LIMIT=10000
+      - PYTHONUNBUFFERED=1
+      # Set to "true" to delete and recreate the Elasticsearch index on startup
+      - RECREATE_INDEX=false
+      # Set to "true" to skip preprocessing when index already exists (faster restarts)
+      - SKIP_PREPROCESSING_IF_INDEX_EXISTS=true
+      # Set to "true" to use keyword-only extraction (no Ollama for aspect extraction)
+      - NO_LLM=true
+      # Reach Ollama on host (Mac/Windows Docker Desktop). Linux: use host network or extra_hosts.
+      - OLLAMA_HOST=http://host.docker.internal:11434
+    volumes:
+      - ./data:/app/data
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    networks:
+      - opinion-search-network
+    command: ["python", "-u", "preprocess_and_train.py"]
+    restart: on-failure
+
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    container_name: opinion-search-backend
+    environment:
+      - FLASK_HOST=0.0.0.0
+      - FLASK_PORT=5000
+      - FLASK_DEBUG=false
+      - ELASTICSEARCH_HOST=elasticsearch
+      - ELASTICSEARCH_PORT=9200
+      - ELASTICSEARCH_SCHEME=http
+      - ELASTICSEARCH_INDEX=product_reviews
+      - DATA_DIR=/app/data
+      - CORS_ORIGINS=http://localhost:3000,http://localhost
+      # Reach Ollama on host (Mac/Windows Docker Desktop). Linux: use host network or extra_hosts.
+      - OLLAMA_HOST=http://host.docker.internal:11434
+    ports:
+      - "5678:5000"
+    volumes:
+      - ./data:/app/data
+      - ./api_key.txt:/app/api_key.txt:ro
+    depends_on:
+      - elasticsearch
+      - preprocessing
+    networks:
+      - opinion-search-network
+    restart: unless-stopped
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:5000/api/health" ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  frontend:
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+    container_name: opinion-search-frontend
+    ports:
+      - "3000:80"
+    depends_on:
+      - backend
+    networks:
+      - opinion-search-network
+    restart: unless-stopped
+
+volumes:
+  elasticsearch_data:
+    driver: local
+
+networks:
+  opinion-search-network:
+    driver: bridge
